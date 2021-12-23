@@ -1,0 +1,11 @@
+.DS_Store
+target
+logs
+
+Icon
+**/.idea
+.idea/
+.idea/**
+*.iml
+**/*.iml
+._*
