@@ -1,0 +1,407 @@
+/*
+ * Copyright (c) 2018-2021 VMware, Inc. or its affiliates, All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package reactor.netty.resources;
+
+import io.netty.channel.Channel;
+import io.netty.resolver.AddressResolverGroup;
+import io.netty.util.internal.PlatformDependent;
+import org.reactivestreams.Publisher;
+import reactor.core.CoreSubscriber;
+import reactor.core.Disposable;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.MonoSink;
+import reactor.core.scheduler.Schedulers;
+import reactor.netty.Connection;
+import reactor.netty.ConnectionObserver;
+import reactor.netty.ReactorNetty;
+import reactor.netty.transport.TransportConfig;
+import reactor.pool.AllocationStrategy;
+import reactor.pool.InstrumentedPool;
+import reactor.pool.Pool;
+import reactor.pool.PoolBuilder;
+import reactor.pool.PoolConfig;
+import reactor.pool.PooledRef;
+import reactor.pool.PooledRefMetadata;
+import reactor.pool.decorators.GracefulShutdownInstrumentedPool;
+import reactor.pool.decorators.InstrumentedPoolDecorators;
+import reactor.pool.introspection.SamplingAllocationStrategy;
+import reactor.util.Logger;
+import reactor.util.Loggers;
+import reactor.util.annotation.Nullable;
+
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiPredicate;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import static reactor.netty.ReactorNetty.format;
+import static reactor.netty.resources.ConnectionProvider.ConnectionPoolSpec.PENDING_ACQUIRE_MAX_COUNT_NOT_SPECIFIED;
+
+/**
+ * Base {@link ConnectionProvider} implementation.
+ *
+ * @param <T> the poolable resource
+ * @author Violeta Georgieva
+ * @since 1.0.0
+ */
+public abstract class PooledConnectionProvider<T extends Connection> implements ConnectionProvider {
+	final PoolFactory<T> defaultPoolFactory;
+
+	final ConcurrentMap<PoolKey, InstrumentedPool<T>> channelPools = PlatformDependent.newConcurrentHashMap();
+
+	final String name;
+	final Duration inactivePoolDisposeInterval;
+	final Duration poolInactivity;
+	final Duration disposeTimeout;
+
+	protected PooledConnectionProvider(Builder builder) {
+		this(builder, null);
+	}
+
+	// Used only for testing purposes
+	PooledConnectionProvider(Builder builder, @Nullable Clock clock) {
+		this.name = builder.name;
+		this.inactivePoolDisposeInterval = builder.inactivePoolDisposeInterval;
+		this.poolInactivity = builder.poolInactivity;
+		this.disposeTimeout = builder.disposeTimeout;
+		this.defaultPoolFactory = new PoolFactory<>(builder, builder.disposeTimeout, clock);
+		scheduleInactivePoolsDisposal();
+	}
+
+	@Override
+	public final Mono<? extends Connection> acquire(
+			TransportConfig config,
+			ConnectionObserver connectionObserver,
+			@Nullable Supplier<? extends SocketAddress> remote,
+			@Nullable AddressResolverGroup<?> resolverGroup) {
+		Objects.requireNonNull(config, "config");
+		Objects.requireNonNull(connectionObserver, "connectionObserver");
+		Objects.requireNonNull(remote, "remoteAddress");
+		Objects.requireNonNull(resolverGroup, "resolverGroup");
+		return Mono.create(sink -> {
+			SocketAddress remoteAddress = Objects.requireNonNull(remote.get(), "Remote Address supplier returned null");
+			PoolKey holder = new PoolKey(remoteAddress, config.channelHash());
+			PoolFactory<T> poolFactory = poolFactory(remoteAddress);
+			InstrumentedPool<T> pool = channelPools.computeIfAbsent(holder, poolKey -> {
+				if (log.isDebugEnabled()) {
+					log.debug("Creating a new [{}] client pool [{}] for [{}]", name, poolFactory, remoteAddress);
+				}
+
+				return createPool(config, poolFactory, remoteAddress, resolverGroup);
+			});
+
+			pool.acquire(Duration.ofMillis(poolFactory.pendingAcquireTimeout))
+			    .subscribe(createDisposableAcquire(config, connectionObserver,
+			            poolFactory.pendingAcquireTimeout, pool, sink));
+		});
+	}
+
+	@Override
+	public final Mono<Void> disposeLater() {
+		return Mono.defer(() -> {
+			List<Mono<Void>> pools;
+			pools = channelPools.entrySet()
+			                    .stream()
+			                    .map(e -> {
+			                        Pool<T> pool = e.getValue();
+			                        if (pool instanceof GracefulShutdownInstrumentedPool) {
+			                            return ((GracefulShutdownInstrumentedPool<T>) pool)
+			                                    .disposeGracefully(disposeTimeout)
+			                                    .onErrorResume(t -> {
+			                                        log.error("Connection pool for [{}] didn't shut down gracefully", e.getKey(), t);
+			                                        return Mono.empty();
+			                                    });
+			                        }
+			                        return pool.disposeLater();
+			                    })
+			                    .collect(Collectors.toList());
+			if (pools.isEmpty()) {
+				return Mono.empty();
+			}
+			channelPools.clear();
+			return Mono.when(pools);
+		});
+	}
+
+	@Override
+	public final void disposeWhen(SocketAddress address) {
+		List<Map.Entry<PoolKey, InstrumentedPool<T>>> toDispose;
+
+		toDispose = channelPools.entrySet()
+		                        .stream()
+		                        .filter(p -> compareAddresses(p.getKey().holder, address))
+		                        .collect(Collectors.toList());
+
+		toDispose.forEach(e -> {
+			if (channelPools.remove(e.getKey(), e.getValue())) {
+				if (log.isDebugEnabled()) {
+					log.debug("ConnectionProvider[name={}]: Disposing pool for [{}]", name, e.getKey().fqdn);
+				}
+				e.getValue().dispose();
+			}
+		});
+	}
+
+	@Override
+	public final boolean isDisposed() {
+		return channelPools.isEmpty() || channelPools.values()
+		                                             .stream()
+		                                             .allMatch(Disposable::isDisposed);
+	}
+
+	@Override
+	public int maxConnections() {
+		return defaultPoolFactory.maxConnections;
+	}
+
+	protected abstract CoreSubscriber<PooledRef<T>> createDisposableAcquire(
+			TransportConfig config,
+			ConnectionObserver connectionObserver,
+			long pendingAcquireTimeout,
+			InstrumentedPool<T> pool,
+			MonoSink<Connection> sink);
+
+	protected abstract InstrumentedPool<T> createPool(
+			TransportConfig config,
+			PoolFactory<T> poolFactory,
+			SocketAddress remoteAddress,
+			AddressResolverGroup<?> resolverGroup);
+
+	protected PoolFactory<T> poolFactory(SocketAddress remoteAddress) {
+		return this.defaultPoolFactory;
+	}
+
+	final boolean compareAddresses(SocketAddress origin, SocketAddress target) {
+		if (origin.equals(target)) {
+			return true;
+		}
+		else if (origin instanceof InetSocketAddress && target instanceof InetSocketAddress) {
+			InetSocketAddress isaOrigin = (InetSocketAddress) origin;
+			InetSocketAddress isaTarget = (InetSocketAddress) target;
+			if (isaOrigin.getPort() == isaTarget.getPort()) {
+				InetAddress iaTarget = isaTarget.getAddress();
+				return (iaTarget != null && iaTarget.isAnyLocalAddress()) ||
+							   Objects.equals(isaOrigin.getHostString(), isaTarget.getHostString());
+			}
+		}
+		return false;
+	}
+
+	protected static void logPoolState(Channel channel, InstrumentedPool<? extends Connection> pool, String msg) {
+		logPoolState(channel, pool, msg, null);
+	}
+
+	protected static void logPoolState(Channel channel, InstrumentedPool<? extends Connection> pool, String msg, @Nullable Throwable t) {
+		InstrumentedPool.PoolMetrics metrics = pool.metrics();
+		log.debug(format(channel, "{}, now: {} active connections, {} inactive connections and {} pending acquire requests."),
+				msg,
+				metrics.acquiredSize(),
+				metrics.idleSize(),
+				metrics.pendingAcquireSize(),
+				t == null ? "" : t);
+	}
+
+	final void scheduleInactivePoolsDisposal() {
+		if (!inactivePoolDisposeInterval.isZero()) {
+			Schedulers.parallel()
+			          .schedule(this::disposeInactivePoolsInBackground, inactivePoolDisposeInterval.toMillis(), TimeUnit.MILLISECONDS);
+		}
+	}
+
+	final void disposeInactivePoolsInBackground() {
+		if (!channelPools.isEmpty()) {
+			List<Map.Entry<PoolKey, InstrumentedPool<T>>> toDispose;
+
+			toDispose = channelPools.entrySet()
+			                        .stream()
+			                        .filter(p -> p.getValue().metrics().isInactiveForMoreThan(poolInactivity))
+			                        .collect(Collectors.toList());
+
+			toDispose.forEach(e -> {
+				if (channelPools.remove(e.getKey(), e.getValue())) {
+					if (log.isDebugEnabled()) {
+						log.debug("ConnectionProvider[name={}]: Disposing inactive pool for [{}]", name, e.getKey().fqdn);
+					}
+					e.getValue().dispose();
+				}
+			});
+		}
+		scheduleInactivePoolsDisposal();
+	}
+
+	static final Logger log = Loggers.getLogger(PooledConnectionProvider.class);
+
+	protected static final class PoolFactory<T extends Connection> {
+		static final double DEFAULT_POOL_GET_PERMITS_SAMPLING_RATE;
+		static {
+			double getPermitsSamplingRate =
+					Double.parseDouble(System.getProperty(ReactorNetty.POOL_GET_PERMITS_SAMPLING_RATE, "0"));
+			if (getPermitsSamplingRate > 1d) {
+				DEFAULT_POOL_GET_PERMITS_SAMPLING_RATE = 0;
+				log.warn("Invalid configuration [" + ReactorNetty.POOL_GET_PERMITS_SAMPLING_RATE + "=" + getPermitsSamplingRate +
+						"], the value must be between 0d and 1d (percentage). SamplingAllocationStrategy in not enabled.");
+			}
+			else {
+				DEFAULT_POOL_GET_PERMITS_SAMPLING_RATE = getPermitsSamplingRate;
+			}
+		}
+
+		static final double DEFAULT_POOL_RETURN_PERMITS_SAMPLING_RATE;
+		static {
+			double returnPermitsSamplingRate =
+					Double.parseDouble(System.getProperty(ReactorNetty.POOL_RETURN_PERMITS_SAMPLING_RATE, "0"));
+			if (returnPermitsSamplingRate > 1d) {
+				DEFAULT_POOL_RETURN_PERMITS_SAMPLING_RATE = 0;
+				log.warn("Invalid configuration [" + ReactorNetty.POOL_RETURN_PERMITS_SAMPLING_RATE + "=" + returnPermitsSamplingRate +
+						"], the value must be between 0d and 1d (percentage). SamplingAllocationStrategy is enabled.");
+			}
+			else {
+				DEFAULT_POOL_RETURN_PERMITS_SAMPLING_RATE = returnPermitsSamplingRate;
+			}
+		}
+
+		final Duration evictionInterval;
+		final String leasingStrategy;
+		final int maxConnections;
+		final long maxIdleTime;
+		final long maxLifeTime;
+		final boolean metricsEnabled;
+		final int pendingAcquireMaxCount;
+		final long pendingAcquireTimeout;
+		final Supplier<? extends MeterRegistrar> registrar;
+		final Clock clock;
+		final Duration disposeTimeout;
+
+		PoolFactory(ConnectionPoolSpec<?> conf, Duration disposeTimeout) {
+			this(conf, disposeTimeout, null);
+		}
+
+		// Used only for testing purposes
+		PoolFactory(ConnectionPoolSpec<?> conf, Duration disposeTimeout, @Nullable Clock clock) {
+			this.evictionInterval = conf.evictionInterval;
+			this.leasingStrategy = conf.leasingStrategy;
+			this.maxConnections = conf.maxConnections;
+			this.maxIdleTime = conf.maxIdleTime != null ? conf.maxIdleTime.toMillis() : -1;
+			this.maxLifeTime = conf.maxLifeTime != null ? conf.maxLifeTime.toMillis() : -1;
+			this.metricsEnabled = conf.metricsEnabled;
+			this.pendingAcquireMaxCount = conf.pendingAcquireMaxCount == PENDING_ACQUIRE_MAX_COUNT_NOT_SPECIFIED ?
+					2 * conf.maxConnections : conf.pendingAcquireMaxCount;
+			this.pendingAcquireTimeout = conf.pendingAcquireTimeout.toMillis();
+			this.registrar = conf.registrar;
+			this.clock = clock;
+			this.disposeTimeout = disposeTimeout;
+		}
+
+		public InstrumentedPool<T> newPool(
+				Publisher<T> allocator,
+				@Nullable AllocationStrategy allocationStrategy,
+				Function<T, Publisher<Void>> destroyHandler,
+				BiPredicate<T, PooledRefMetadata> evictionPredicate) {
+			PoolBuilder<T, PoolConfig<T>> poolBuilder =
+					PoolBuilder.from(allocator)
+					           .destroyHandler(destroyHandler)
+					           .evictionPredicate(evictionPredicate
+					                   .or((poolable, meta) -> (maxIdleTime != -1 && meta.idleTime() >= maxIdleTime)
+					                           || (maxLifeTime != -1 && meta.lifeTime() >= maxLifeTime)))
+					           .maxPendingAcquire(pendingAcquireMaxCount)
+					           .evictInBackground(evictionInterval);
+
+			if (DEFAULT_POOL_GET_PERMITS_SAMPLING_RATE > 0d && DEFAULT_POOL_GET_PERMITS_SAMPLING_RATE <= 1d
+					&& DEFAULT_POOL_RETURN_PERMITS_SAMPLING_RATE > 0d && DEFAULT_POOL_RETURN_PERMITS_SAMPLING_RATE <= 1d) {
+				poolBuilder = poolBuilder.allocationStrategy(SamplingAllocationStrategy.sizeBetweenWithSampling(
+						0,
+						maxConnections,
+						DEFAULT_POOL_GET_PERMITS_SAMPLING_RATE,
+						DEFAULT_POOL_RETURN_PERMITS_SAMPLING_RATE));
+			}
+			else {
+				poolBuilder = poolBuilder.sizeBetween(0, maxConnections);
+			}
+
+			if (clock != null) {
+				poolBuilder = poolBuilder.clock(clock);
+			}
+
+			if (LEASING_STRATEGY_FIFO.equals(leasingStrategy)) {
+				poolBuilder = poolBuilder.idleResourceReuseLruOrder();
+			}
+			else {
+				poolBuilder = poolBuilder.idleResourceReuseMruOrder();
+			}
+
+			if (disposeTimeout != null) {
+				return poolBuilder.buildPoolAndDecorateWith(InstrumentedPoolDecorators::gracefulShutdown);
+			}
+
+			return poolBuilder.buildPool();
+		}
+
+		@Override
+		public String toString() {
+			return "PoolFactory{" +
+					"evictionInterval=" + evictionInterval +
+					", leasingStrategy=" + leasingStrategy +
+					", maxConnections=" + maxConnections +
+					", maxIdleTime=" + maxIdleTime +
+					", maxLifeTime=" + maxLifeTime +
+					", metricsEnabled=" + metricsEnabled +
+					", pendingAcquireMaxCount=" + pendingAcquireMaxCount +
+					", pendingAcquireTimeout=" + pendingAcquireTimeout +
+					'}';
+		}
+	}
+
+	static final class PoolKey {
+		final String fqdn;
+		final SocketAddress holder;
+		final int pipelineKey;
+
+		PoolKey(SocketAddress holder, int pipelineKey) {
+			this.fqdn = holder.toString();
+			this.holder = holder;
+			this.pipelineKey = pipelineKey;
+		}
+
+		@Override
+		public boolean equals(Object o) {
+			if (this == o) {
+				return true;
+			}
+			if (o == null || getClass() != o.getClass()) {
+				return false;
+			}
+			PoolKey poolKey = (PoolKey) o;
+			return Objects.equals(fqdn, poolKey.fqdn) &&
+						   Objects.equals(holder, poolKey.holder) &&
+						   pipelineKey == poolKey.pipelineKey;
+		}
+
+		@Override
+		public int hashCode() {
+			return Objects.hash(fqdn, holder, pipelineKey);
+		}
+	}
+}

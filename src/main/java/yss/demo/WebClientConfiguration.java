@@ -24,6 +24,7 @@ import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.http.client.reactive.ReactorResourceFactory;
 import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.scheduler.Schedulers;
 import reactor.netty.ReactorNetty;
 import reactor.netty.http.Http11SslContextSpec;
 import reactor.netty.http.HttpProtocol;
@@ -196,6 +197,7 @@ public class WebClientConfiguration {
     @Order(Ordered.LOWEST_PRECEDENCE - 10)
     public WebClientCustomizer loadbalancedWebClientCustomizer(@Value("${debug:false}") boolean debug) {
         ExchangeFilterFunction filter = (request, next) -> next.exchange(request)
+//                .subscribeOn(Schedulers.boundedElastic()) // After adding subscribeOn, there is no hot thread anymore
                 .doFinally(signalType -> log.debug(
                         "{} exchange filter function, signalType = {}", request.logPrefix(), signalType));
 
